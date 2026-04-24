@@ -13,7 +13,7 @@ local Camera            = workspace.CurrentCamera
 local lp = Players.LocalPlayer
 
 -- Bypass void death instantly
-pcall(function() workspace.FallenPartsDestroyHeight = -50000 end)
+pcall(function() workspace.FallenPartsDestroyHeight = -9e9 end)
 
 -- ============================================================
 -- connection manager
@@ -186,6 +186,9 @@ local cfg = {
     -- anti debuffs
     noEndlag = false, noStun = false, noStompCd = false,
     noHurt = false, noRagdoll = false, autoSprint = false,
+
+    -- anti rager
+    desync = false, velSpoof = false, antiBring = false, antiAttach = false,
 
     -- survival
     autoHeal = false, healTh = 60, healCd = 3,
@@ -595,6 +598,8 @@ lp.CharacterAdded:Connect(function(c) task.wait(0.5) pcall(setupGuns, c) end)
 local frame = 0
 local bringWait, gotoWait = 0, 0
 local stompWait = 0
+local lastValidPos = nil
+local realCF = nil
 
 reg("heartbeat", RunService.Heartbeat:Connect(function(dt)
     frame = frame + 1
@@ -604,6 +609,47 @@ reg("heartbeat", RunService.Heartbeat:Connect(function(dt)
     if frame % CACHE_INTERVAL == 0 then refreshCache() end
 
     if not r then return end
+    
+    -- === anti attach ===
+    if cfg.antiAttach and myChar then
+        for _, obj in pairs(myChar:GetDescendants()) do
+            if obj:IsA("Weld") or obj:IsA("WeldConstraint") then
+                if not obj:IsDescendantOf(myChar) or (obj.Part1 and not obj.Part1:IsDescendantOf(myChar)) then
+                    pcall(function() obj:Destroy() end)
+                end
+            end
+        end
+    end
+    
+    -- === anti loop bring ===
+    if cfg.antiBring then
+        local isTeleporting = cfg.voidSpam or cfg.voidDodge or cfg.voidHead or cfg.emergTp or cfg.grabBench
+        if lastValidPos and not isTeleporting and (r.Position - lastValidPos).Magnitude > 50 then
+            r.CFrame = CFrame.new(lastValidPos)
+            r.Anchored = true
+            task.delay(0.2, function() if root() then root().Anchored = false end end)
+        else
+            lastValidPos = r.Position
+        end
+    else
+        lastValidPos = nil
+    end
+    
+    -- === velocity spoof (anti-silent aim) ===
+    if cfg.velSpoof then
+        pcall(function()
+            r.AssemblyLinearVelocity = Vector3.new(math.huge, math.huge, math.huge)
+            r.Velocity = Vector3.new(math.huge, math.huge, math.huge)
+        end)
+    end
+    
+    -- === network desync (anti-orbit / anti-goto) ===
+    if cfg.desync then
+        realCF = r.CFrame
+        r.CFrame = realCF * CFrame.new(math.random(-100, 100), math.random(-100, 100), math.random(-100, 100))
+    else
+        realCF = nil
+    end
 
     -- === void spammer ===
     if cfg.voidSpam then
@@ -809,6 +855,11 @@ local hudFrame = 0
 reg("render", RunService.RenderStepped:Connect(function()
     hudFrame = hudFrame + 1
     local r = root()
+    
+    -- === restore desync instantly ===
+    if cfg.desync and r and realCF then
+        r.CFrame = realCF
+    end
 
     -- === determine action (cheap, no alloc) ===
     if cfg.isHealing then cfg.action = "healing..."
@@ -947,7 +998,7 @@ end))
 -- gui
 -- ============================================================
 local W = Library:CreateWindow({
-    Title = 'void master v4 | bloody playground',
+    Title = 'void master v5 | the anti-rager update',
     Center = true, AutoShow = true, TabPadding = 8, MenuFadeTime = 0.2,
 })
 
@@ -959,6 +1010,7 @@ local T = {
     visuals  = W:AddTab('visuals'),
     survival = W:AddTab('survival'),
     misc     = W:AddTab('misc'),
+    anti_rager = W:AddTab('anti-rager'),
     settings = W:AddTab('settings'),
 }
 
@@ -1176,6 +1228,13 @@ mR:AddButton({Text='tp to heal',Func=function() pcall(function() local r=root();
 mR:AddButton({Text='tp to spawn',Func=function() local r=root();if r then r.CFrame=CFrame.new(0,5,0) end end})
 mR:AddButton({Text='tp to safe zone',Func=function() local r=root();if r then r.CFrame=CFrame.new(SAFE_POS) end end})
 
+-- anti-rager tab
+local arL = T.anti_rager:AddLeftGroupbox('defense')
+arL:AddToggle('t_desync',{Text='network desync (anti-orbit)',Default=false,Callback=function(v) cfg.desync=v end})
+arL:AddToggle('t_velspoof',{Text='velocity spoof (anti-silent aim)',Default=false,Callback=function(v) cfg.velSpoof=v end})
+arL:AddToggle('t_antibring',{Text='anti loop-bring',Default=false,Callback=function(v) cfg.antiBring=v end})
+arL:AddToggle('t_antiattach',{Text='anti attach / fling',Default=false,Callback=function(v) cfg.antiAttach=v end})
+
 -- settings
 local stL=T.settings:AddLeftGroupbox('theme')
 local stR=T.settings:AddRightGroupbox('config')
@@ -1202,6 +1261,6 @@ UserInputService.InputBegan:Connect(function(input, gp)
     end
 end)
 
-Library:SetWatermark('void master v4')
+Library:SetWatermark('void master v5')
 Library:SetWatermarkVisibility(true)
-Library:Notify({Title='loaded', Content='v4 loaded! rightshift=toggle | f4=panic', Duration=4})
+Library:Notify({Title='loaded', Content='v5 loaded! rightshift=toggle | f4=panic', Duration=4})
