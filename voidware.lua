@@ -12,6 +12,9 @@ local Camera            = workspace.CurrentCamera
 
 local lp = Players.LocalPlayer
 
+-- Bypass void death instantly
+pcall(function() workspace.FallenPartsDestroyHeight = -50000 end)
+
 -- ============================================================
 -- connection manager
 -- tracks every connection so panic key can kill everything
@@ -118,9 +121,31 @@ end
 -- ============================================================
 -- constants
 -- ============================================================
-local SAFE_POS   = Vector3.new(768.017639, 2389.228760, 390.286804)
+local BENCH_LOCATIONS = {
+    Vector3.new(504.199463, 2389.413818, 485.759338),
+    Vector3.new(571.336060, 2389.174316, 250.059448),
+    Vector3.new(678.740723, 2389.128662, 251.148087),
+    Vector3.new(768.364746, 2389.228516, 390.359741),
+    Vector3.new(817.045166, 2389.123047, 322.078522),
+    Vector3.new(502.039246, 2391.030273, 263.039459),
+    Vector3.new(500.525452, 2391.030273, 248.947220)
+}
+local SAFE_POS   = BENCH_LOCATIONS[4] -- default fallback
 local BENCH_NAME = "G"
 local V3ZERO     = Vector3.zero
+
+local function getClosestBenchPos(currentPos)
+    local closestPos = SAFE_POS
+    local closestDist = math.huge
+    for _, pos in ipairs(BENCH_LOCATIONS) do
+        local dist = (currentPos - pos).Magnitude
+        if dist < closestDist then
+            closestDist = dist
+            closestPos = pos
+        end
+    end
+    return closestPos
+end
 
 -- ============================================================
 -- config
@@ -287,7 +312,7 @@ local fovC = Drawing.new("Circle")
 fovC.Visible=false;fovC.Thickness=2;fovC.NumSides=100;fovC.Filled=false;fovC.Transparency=1;fovC.Color=Color3.fromRGB(0,255,0);fovC.Radius=300
 
 -- pre-built strings (avoid alloc in render)
-local HUD_TITLE = "void master v3"
+local HUD_TITLE = "void master v4"
 
 local function aColor(a)
     if a:find("void") then return Color3.fromRGB(180,0,255)
@@ -434,12 +459,31 @@ end
 local function doEmergency()
     local r = root() ; if not r then return end
     if not emergDb() then return end
-    r.CFrame = CFrame.new(SAFE_POS)+Vector3.new(0,3,0)
+    local closestBenchPos = getClosestBenchPos(r.Position)
+    r.CFrame = CFrame.new(closestBenchPos)+Vector3.new(0,3,0)
     flashDmg(100)
     if cfg.grabBench then
         task.delay(0.3, function()
             local r2 = root() ; if not r2 then return end
-            r2.CFrame = CFrame.new(SAFE_POS + Vector3.new(0,3,-2))
+            -- Dynamically find bench to get its exact front
+            local benchPart = nil
+            local minDist = math.huge
+            for _,obj in pairs(workspace:GetDescendants()) do
+                if obj.Name==BENCH_NAME and obj:IsA("BasePart") then
+                    local dist = (obj.Position - closestBenchPos).Magnitude
+                    if dist < minDist and dist < 20 then
+                        minDist = dist
+                        benchPart = obj
+                    end
+                end
+            end
+            if benchPart then
+                -- Move exactly in front of the bench facing it
+                r2.CFrame = benchPart.CFrame * CFrame.new(0, 0, -3) * CFrame.Angles(0, math.pi, 0)
+            else
+                r2.CFrame = CFrame.new(closestBenchPos + Vector3.new(0,3,-2))
+            end
+            
             task.wait(0.3)
             task.spawn(function()
                 for i=1,30 do
@@ -448,10 +492,8 @@ local function doEmergency()
                     pcall(function() keypress(0x47);task.wait(0.05);keyrelease(0x47) end)
                     pcall(function()
                         local r3 = root() ; if not r3 then return end
-                        for _,obj in pairs(workspace:GetDescendants()) do
-                            if obj.Name==BENCH_NAME and obj:IsA("BasePart") and (obj.Position-r3.Position).Magnitude<20 then
-                                firetouchinterest(r3,obj,0);task.wait(0.05);firetouchinterest(r3,obj,1);break
-                            end
+                        if benchPart and (benchPart.Position-r3.Position).Magnitude<20 then
+                            firetouchinterest(r3,benchPart,0);task.wait(0.05);firetouchinterest(r3,benchPart,1)
                         end
                     end)
                     task.wait(0.1)
@@ -581,6 +623,7 @@ reg("heartbeat", RunService.Heartbeat:Connect(function(dt)
                 elseif ph == 1 then r.CFrame = CFrame.new(r.Position.X + (cfg.voidRand and math.random(-8,8) or 0), depth*1.5, r.Position.Z + (cfg.voidRand and math.random(-8,8) or 0))
                 else r.CFrame = CFrame.new(r.Position.X, math.max(r.Position.Y, 5), r.Position.Z) end
             end
+            pcall(function() r.Velocity=V3ZERO; r.AssemblyLinearVelocity=V3ZERO end)
         end
     end
 
@@ -617,6 +660,7 @@ reg("heartbeat", RunService.Heartbeat:Connect(function(dt)
                     if frame%2==0 then r.CFrame=CFrame.new(pred)
                     else r.CFrame=CFrame.new(pred.X,pred.Y+depth*2,pred.Z) end
                 end
+                pcall(function() r.Velocity=V3ZERO; r.AssemblyLinearVelocity=V3ZERO end)
             end
         end
     end
@@ -632,8 +676,26 @@ reg("heartbeat", RunService.Heartbeat:Connect(function(dt)
                 myChar:SetAttribute("Ragdoll",false)
                 myChar:SetAttribute("Endlag",false)
             end)
+            -- actively destroy hitboxes if they try to touch
+            for _, desc in pairs(myChar:GetDescendants()) do
+                if desc:IsA("BasePart") then
+                    desc.LocalTransparencyModifier = 0
+                end
+            end
+            
+            -- add invisible forcefield to bypass most kill scripts
+            if not myChar:FindFirstChildOfClass("ForceField") then
+                local ff = Instance.new("ForceField")
+                ff.Visible = false
+                ff.Parent = myChar
+            end
         end
         pcall(function() r.Velocity=Vector3.new(r.Velocity.X, math.max(r.Velocity.Y,-50), r.Velocity.Z) end)
+    else
+        if myChar then
+            local ff = myChar:FindFirstChildOfClass("ForceField")
+            if ff then ff:Destroy() end
+        end
     end
 
     -- === anti void ===
@@ -885,7 +947,7 @@ end))
 -- gui
 -- ============================================================
 local W = Library:CreateWindow({
-    Title = 'void master v3 | bloody playground',
+    Title = 'void master v4 | bloody playground',
     Center = true, AutoShow = true, TabPadding = 8, MenuFadeTime = 0.2,
 })
 
@@ -1058,11 +1120,34 @@ sR:AddDivider()
 sR:AddButton({Text='emergency tp now',Func=doEmergency})
 sR:AddButton({Text='grab bench now',Func=function()
     local r=root();if not r then return end
-    r.CFrame=CFrame.new(SAFE_POS+Vector3.new(0,3,-2));task.wait(0.3)
+    local closestBenchPos = getClosestBenchPos(r.Position)
+    local benchPart = nil
+    local minDist = math.huge
+    for _,obj in pairs(workspace:GetDescendants()) do
+        if obj.Name==BENCH_NAME and obj:IsA("BasePart") then
+            local dist = (obj.Position - closestBenchPos).Magnitude
+            if dist < minDist and dist < 20 then
+                minDist = dist
+                benchPart = obj
+            end
+        end
+    end
+    if benchPart then
+        r.CFrame = benchPart.CFrame * CFrame.new(0, 0, -3) * CFrame.Angles(0, math.pi, 0)
+    else
+        r.CFrame=CFrame.new(closestBenchPos+Vector3.new(0,3,-2))
+    end
+    task.wait(0.3)
     task.spawn(function() for i=1,30 do
         if not cfg.grabBench then break end
         pcall(function() local vim=game:GetService("VirtualInputManager");vim:SendKeyEvent(true,Enum.KeyCode.G,false,game);task.wait(0.05);vim:SendKeyEvent(false,Enum.KeyCode.G,false,game) end)
         pcall(function() keypress(0x47);task.wait(0.05);keyrelease(0x47) end)
+        pcall(function()
+            local r3 = root() ; if not r3 then return end
+            if benchPart and (benchPart.Position-r3.Position).Magnitude<20 then
+                firetouchinterest(r3,benchPart,0);task.wait(0.05);firetouchinterest(r3,benchPart,1)
+            end
+        end)
         task.wait(0.1)
     end end)
 end})
@@ -1117,6 +1202,6 @@ UserInputService.InputBegan:Connect(function(input, gp)
     end
 end)
 
-Library:SetWatermark('void master v3')
+Library:SetWatermark('void master v4')
 Library:SetWatermarkVisibility(true)
-Library:Notify({Title='loaded', Content='rightshift=toggle | f4=panic', Duration=4})
+Library:Notify({Title='loaded', Content='v4 loaded! rightshift=toggle | f4=panic', Duration=4})
