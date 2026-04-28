@@ -774,6 +774,8 @@ local bringWait, gotoWait = 0, 0
 local stompWait = 0
 local lastValidPos = nil
 local realCF = nil
+local surfacePos = nil -- remembers where you were BEFORE entering the void
+local orbitAP, orbitAO, orbitAtt = nil, nil, nil -- cached orbit constraints
 
 reg("heartbeat", RunService.Heartbeat:Connect(function(dt)
     frame = frame + 1
@@ -797,20 +799,26 @@ reg("heartbeat", RunService.Heartbeat:Connect(function(dt)
     
     -- === anti loop bring ===
     if cfg.antiBring then
-        local isTeleporting = cfg.voidSpam or cfg.voidDodge or cfg.voidHead or cfg.emergTp or cfg.grabBench
-        if lastValidPos and not isTeleporting and (r.Position - lastValidPos).Magnitude > 50 then
-            r.CFrame = CFrame.new(lastValidPos)
-            r.Anchored = true
-            task.delay(0.2, function() if root() then root().Anchored = false end end)
-        else
-            lastValidPos = r.Position
+        -- exclude ALL self-teleport features so anti-bring doesn't fight our own scripts
+        local isTeleporting = cfg.voidSpam or cfg.voidDodge or cfg.voidHead 
+            or cfg.orbit or cfg.bring or cfg.goTo or cfg.spin
+            or cfg.emergTp or cfg.grabBench or cfg.isHealing
+        if not isTeleporting then
+            if lastValidPos and (r.Position - lastValidPos).Magnitude > 50 then
+                r.CFrame = CFrame.new(lastValidPos)
+                pcall(function() r.Velocity=V3ZERO;r.AssemblyLinearVelocity=V3ZERO end)
+                r.Anchored = true
+                task.delay(0.15, function() if root() then root().Anchored = false end end)
+            else
+                lastValidPos = r.Position
+            end
         end
     else
         lastValidPos = nil
     end
     
     -- === velocity spoof (anti-silent aim) ===
-    if cfg.velSpoof then
+    if cfg.velSpoof and not cfg.voidSpam and not cfg.voidHead then
         pcall(function()
             r.AssemblyLinearVelocity = Vector3.new(math.huge, math.huge, math.huge)
             r.Velocity = Vector3.new(math.huge, math.huge, math.huge)
@@ -821,30 +829,42 @@ reg("heartbeat", RunService.Heartbeat:Connect(function(dt)
 
     -- === void spammer ===
     if cfg.voidSpam then
+        -- save surface position on first frame of void spam
+        if not surfacePos and r.Position.Y > -10 then
+            surfacePos = Vector3.new(r.Position.X, r.Position.Y, r.Position.Z)
+        end
         local depth = cfg.voidDepth
         if cfg.voidRand then depth = depth + math.random(-200, 200) end
         local run = (cfg.voidSpeed == 3) or (cfg.voidSpeed == 2 and frame % 2 == 0) or (cfg.voidSpeed == 1 and frame % 3 == 0)
         if run then
+            local sx = surfacePos and surfacePos.X or r.Position.X
+            local sy = surfacePos and surfacePos.Y or 50
+            local sz = surfacePos and surfacePos.Z or r.Position.Z
             if cfg.voidPhases == 2 then
                 if frame % 2 == 0 then
-                    r.CFrame = CFrame.new(r.Position.X + (cfg.voidRand and math.random(-3,3) or 0), depth, r.Position.Z + (cfg.voidRand and math.random(-3,3) or 0))
+                    r.CFrame = CFrame.new(sx + (cfg.voidRand and math.random(-3,3) or 0), depth, sz + (cfg.voidRand and math.random(-3,3) or 0))
                 else
-                    r.CFrame = CFrame.new(r.Position.X, math.max(r.Position.Y, 5), r.Position.Z)
+                    r.CFrame = CFrame.new(sx, math.max(sy, 5), sz)
                 end
             else
                 local ph = frame % 3
-                if ph == 0 then r.CFrame = CFrame.new(r.Position.X, depth, r.Position.Z)
-                elseif ph == 1 then r.CFrame = CFrame.new(r.Position.X + (cfg.voidRand and math.random(-8,8) or 0), depth*1.5, r.Position.Z + (cfg.voidRand and math.random(-8,8) or 0))
-                else r.CFrame = CFrame.new(r.Position.X, math.max(r.Position.Y, 5), r.Position.Z) end
+                if ph == 0 then r.CFrame = CFrame.new(sx, depth, sz)
+                elseif ph == 1 then r.CFrame = CFrame.new(sx + (cfg.voidRand and math.random(-8,8) or 0), depth*1.5, sz + (cfg.voidRand and math.random(-8,8) or 0))
+                else r.CFrame = CFrame.new(sx, math.max(sy, 5), sz) end
             end
             pcall(function() r.Velocity=V3ZERO; r.AssemblyLinearVelocity=V3ZERO end)
         end
+    else
+        surfacePos = nil -- reset when void spam is off
     end
 
     -- === void dodge ===
     if cfg.voidDodge and r.Position.Y < cfg.dodgeThresh then
+        -- dodge to a random direction but stay near your XZ
+        local baseX = surfacePos and surfacePos.X or r.Position.X
+        local baseZ = surfacePos and surfacePos.Z or r.Position.Z
         local ang = math.random() * math.pi * 2
-        r.CFrame = CFrame.new(r.Position.X + math.cos(ang)*cfg.dodgeBoost, cfg.safeY, r.Position.Z + math.sin(ang)*cfg.dodgeBoost)
+        r.CFrame = CFrame.new(baseX + math.cos(ang)*cfg.dodgeBoost, cfg.safeY, baseZ + math.sin(ang)*cfg.dodgeBoost)
         pcall(function() r.Velocity=V3ZERO;r.AssemblyLinearVelocity=V3ZERO end)
     end
 
@@ -930,51 +950,47 @@ reg("heartbeat", RunService.Heartbeat:Connect(function(dt)
                 local tPos = tHRP.Position
                 local np = Vector3.new(tPos.X+math.cos(cfg.oAng)*cfg.oRad, tPos.Y+cfg.oH+bobY, tPos.Z+math.sin(cfg.oAng)*cfg.oRad)
                 
-                -- Use AlignPosition and AlignOrientation for butter-smooth orbit
-                local ap = r:FindFirstChild("OrbitAlignPosition")
-                local ao = r:FindFirstChild("OrbitAlignOrientation")
-                local att1 = r:FindFirstChild("OrbitAttachment")
-                if not att1 then
-                    att1 = Instance.new("Attachment", r)
-                    att1.Name = "OrbitAttachment"
+                -- Create constraints once, then just update targets
+                if not orbitAtt or not orbitAtt.Parent then
+                    orbitAtt = Instance.new("Attachment", r)
+                    orbitAtt.Name = "OrbitAttachment"
+                end
+                if not orbitAP or not orbitAP.Parent then
+                    orbitAP = Instance.new("AlignPosition", r)
+                    orbitAP.Name = "OrbitAlignPosition"
+                    orbitAP.Mode = Enum.PositionAlignmentMode.OneAttachment
+                    orbitAP.Attachment0 = orbitAtt
+                    orbitAP.MaxForce = math.huge
+                end
+                if not orbitAO or not orbitAO.Parent then
+                    orbitAO = Instance.new("AlignOrientation", r)
+                    orbitAO.Name = "OrbitAlignOrientation"
+                    orbitAO.Mode = Enum.OrientationAlignmentMode.OneAttachment
+                    orbitAO.Attachment0 = orbitAtt
+                    orbitAO.MaxTorque = math.huge
                 end
                 
-                if not ap then
-                    ap = Instance.new("AlignPosition", r)
-                    ap.Name = "OrbitAlignPosition"
-                    ap.Mode = Enum.PositionAlignmentMode.OneAttachment
-                    ap.Attachment0 = att1
-                    ap.Responsiveness = 200
-                    ap.MaxForce = math.huge
-                end
-                if not ao then
-                    ao = Instance.new("AlignOrientation", r)
-                    ao.Name = "OrbitAlignOrientation"
-                    ao.Mode = Enum.OrientationAlignmentMode.OneAttachment
-                    ao.Attachment0 = att1
-                    ao.Responsiveness = 200
-                    ao.MaxTorque = math.huge
-                end
+                -- Update responsiveness live (user can change it)
+                orbitAP.Responsiveness = cfg.oSmooth or 200
+                orbitAO.Responsiveness = cfg.oSmooth or 200
                 
-                ap.Position = np
+                orbitAP.Position = np
                 if cfg.oFace then
-                    ao.CFrame = CFrame.lookAt(np, tPos)
+                    orbitAO.CFrame = CFrame.lookAt(np, tPos)
                 else
                     local tan=Vector3.new(-math.sin(cfg.oAng),0,math.cos(cfg.oAng))*dir
-                    ao.CFrame = CFrame.lookAt(np,np+tan)
+                    orbitAO.CFrame = CFrame.lookAt(np,np+tan)
                 end
+                
+                -- Zero velocity so we don't drift
+                pcall(function() r.Velocity=V3ZERO;r.AssemblyLinearVelocity=V3ZERO end)
             end
         end
     else
-        -- Clean up align constraints if orbit is off
-        if r then
-            local ap = r:FindFirstChild("OrbitAlignPosition")
-            local ao = r:FindFirstChild("OrbitAlignOrientation")
-            local att1 = r:FindFirstChild("OrbitAttachment")
-            if ap then ap:Destroy() end
-            if ao then ao:Destroy() end
-            if att1 then att1:Destroy() end
-        end
+        -- Clean up cached constraints if orbit is off
+        if orbitAP then pcall(function() orbitAP:Destroy() end); orbitAP = nil end
+        if orbitAO then pcall(function() orbitAO:Destroy() end); orbitAO = nil end
+        if orbitAtt then pcall(function() orbitAtt:Destroy() end); orbitAtt = nil end
     end
 
     -- === loop bring ===
