@@ -214,9 +214,16 @@ end
 
 local function toggleRakNetDesync(v)
     if v then
-        local r = root()
-        if r then createGhost(r.Position) end
-        pcall(function() raknet.add_send_hook(rakhook) end)
+        -- NOTE: root() is defined later in the file, so we inline the lookup here
+        local char = lp.Character
+        local hrp = char and char:FindFirstChild("HumanoidRootPart")
+        if hrp then
+            createGhost(hrp.Position)
+        end
+        local ok, err = pcall(function() raknet.add_send_hook(rakhook) end)
+        if not ok then
+            warn("[void master] raknet hook failed: " .. tostring(err))
+        end
     else
         pcall(function() raknet.remove_send_hook(rakhook) end)
         removeGhost()
@@ -485,7 +492,7 @@ local fovC = Drawing.new("Circle")
 fovC.Visible=false;fovC.Thickness=2;fovC.NumSides=100;fovC.Filled=false;fovC.Transparency=1;fovC.Color=Color3.fromRGB(0,255,0);fovC.Radius=300
 
 -- pre-built strings (avoid alloc in render)
-local HUD_TITLE = "void master v4"
+local HUD_TITLE = "void master v5"
 
 local function aColor(a)
     if a:find("void") then return Color3.fromRGB(180,0,255)
@@ -658,18 +665,15 @@ local function doEmergency()
             end
             
             task.wait(0.3)
-            task.spawn(function()
-                for i=1,30 do
-                    if not cfg.grabBench then break end
-                    pcall(function() local vim=game:GetService("VirtualInputManager");vim:SendKeyEvent(true,Enum.KeyCode.G,false,game);task.wait(0.05);vim:SendKeyEvent(false,Enum.KeyCode.G,false,game) end)
-                    pcall(function() keypress(0x47);task.wait(0.05);keyrelease(0x47) end)
-                    pcall(function()
-                        local r3 = root() ; if not r3 then return end
-                        if benchPart and (benchPart.Position-r3.Position).Magnitude<20 then
-                            firetouchinterest(r3,benchPart,0);task.wait(0.05);firetouchinterest(r3,benchPart,1)
-                        end
-                    end)
-                    task.wait(0.1)
+            -- Press G exactly ONCE (G is a toggle: press=grab, press again=drop)
+            pcall(function() local vim=game:GetService("VirtualInputManager");vim:SendKeyEvent(true,Enum.KeyCode.G,false,game);task.wait(0.05);vim:SendKeyEvent(false,Enum.KeyCode.G,false,game) end)
+            pcall(function() keypress(0x47);task.wait(0.05);keyrelease(0x47) end)
+            -- Single touch interest fire as backup
+            task.wait(0.1)
+            pcall(function()
+                local r3 = root() ; if not r3 then return end
+                if benchPart and (benchPart.Position-r3.Position).Magnitude<20 then
+                    firetouchinterest(r3,benchPart,0);task.wait(0.05);firetouchinterest(r3,benchPart,1)
                 end
             end)
         end)
@@ -1393,18 +1397,16 @@ sR:AddButton({Text='grab bench now',Func=function()
         r.CFrame=CFrame.new(closestBenchPos+Vector3.new(0,3,-2))
     end
     task.wait(0.3)
-    task.spawn(function() for i=1,30 do
-        if not cfg.grabBench then break end
-        pcall(function() local vim=game:GetService("VirtualInputManager");vim:SendKeyEvent(true,Enum.KeyCode.G,false,game);task.wait(0.05);vim:SendKeyEvent(false,Enum.KeyCode.G,false,game) end)
-        pcall(function() keypress(0x47);task.wait(0.05);keyrelease(0x47) end)
-        pcall(function()
-            local r3 = root() ; if not r3 then return end
-            if benchPart and (benchPart.Position-r3.Position).Magnitude<20 then
-                firetouchinterest(r3,benchPart,0);task.wait(0.05);firetouchinterest(r3,benchPart,1)
-            end
-        end)
-        task.wait(0.1)
-    end end)
+    -- Press G exactly ONCE
+    pcall(function() local vim=game:GetService("VirtualInputManager");vim:SendKeyEvent(true,Enum.KeyCode.G,false,game);task.wait(0.05);vim:SendKeyEvent(false,Enum.KeyCode.G,false,game) end)
+    pcall(function() keypress(0x47);task.wait(0.05);keyrelease(0x47) end)
+    task.wait(0.1)
+    pcall(function()
+        local r3 = root() ; if not r3 then return end
+        if benchPart and (benchPart.Position-r3.Position).Magnitude<20 then
+            firetouchinterest(r3,benchPart,0);task.wait(0.05);firetouchinterest(r3,benchPart,1)
+        end
+    end)
 end})
 
 sB:AddToggle('t_god',{Text='godmode',Default=false,Callback=function(v) cfg.godmode=v end})
@@ -1433,13 +1435,31 @@ mR:AddButton({Text='tp to safe zone',Func=function() local r=root();if r then r.
 
 -- anti-rager tab
 local arL = T.anti_rager:AddLeftGroupbox('defense')
+local arR = T.anti_rager:AddRightGroupbox('info')
 arL:AddToggle('t_desync',{Text='network desync (raknet)',Default=false,Callback=function(v) 
     cfg.desync=v 
     toggleRakNetDesync(v)
+    if v then
+        Library:Notify({Title='desync', Content='raknet hook active - ghost spawned', Duration=3})
+    else
+        Library:Notify({Title='desync', Content='raknet hook removed', Duration=2})
+    end
 end})
+arL:AddLabel('freezes your server hitbox, enemies miss')
+arL:AddDivider()
 arL:AddToggle('t_velspoof',{Text='velocity spoof (anti-silent aim)',Default=false,Callback=function(v) cfg.velSpoof=v end})
+arL:AddLabel('breaks enemy aimbot prediction')
+arL:AddDivider()
 arL:AddToggle('t_antibring',{Text='anti loop-bring',Default=false,Callback=function(v) cfg.antiBring=v end})
+arL:AddLabel('rubberbands you back if dragged')
+arL:AddDivider()
 arL:AddToggle('t_antiattach',{Text='anti attach / fling',Default=false,Callback=function(v) cfg.antiAttach=v end})
+arL:AddLabel('destroys foreign welds on your char')
+
+arR:AddLabel('desync: intercepts packet 0x1B')
+arR:AddLabel('vel spoof: sets velocity to inf')
+arR:AddLabel('anti-bring: 50 stud threshold')
+arR:AddLabel('anti-attach: checks every frame')
 
 -- settings
 local stL=T.settings:AddLeftGroupbox('theme')
@@ -1462,6 +1482,9 @@ UserInputService.InputBegan:Connect(function(input, gp)
         cfg.orbit=false;cfg.bring=false;cfg.goTo=false;cfg.spin=false
         cfg.silent=false;cfg.stomp=false;cfg.godmode=false;cfg.antiVoid=false
         cfg.autoHeal=false;cfg.emergTp=false
+        -- anti-rager cleanup
+        if cfg.desync then cfg.desync=false;pcall(toggleRakNetDesync,false) end
+        cfg.velSpoof=false;cfg.antiBring=false;cfg.antiAttach=false
         fovC.Visible=false
         Library:Notify({Title='panic', Content='all features disabled', Duration=2})
     end
