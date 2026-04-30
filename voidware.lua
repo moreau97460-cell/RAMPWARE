@@ -76,13 +76,8 @@ local sparkSize = NumberSequence.new({NumberSequenceKeypoint.new(0, 0.18), Numbe
 local ringSizeOuter = NumberSequence.new({NumberSequenceKeypoint.new(0, 0.1), NumberSequenceKeypoint.new(1, 0)})
 local ringSizeInner = NumberSequence.new({NumberSequenceKeypoint.new(0, 0.07), NumberSequenceKeypoint.new(1, 0)})
 
-local function rakhook(packet)
-	if packet.PacketId == 0x1B then
-		local buf = packet.AsBuffer
-		buffer.writeu32(buf, 1, 0xFFFFFFFF)
-		packet:SetData(buf)
-	end
-end
+local spoofCF = nil
+local realCF = nil
 
 local function makeSparks(parent)
 	local att = Instance.new("Attachment", parent)
@@ -212,20 +207,16 @@ local function createGhost(pos)
 	end)
 end
 
-local function toggleRakNetDesync(v)
+local function toggleDesync(v)
     if v then
-        -- NOTE: root() is defined later in the file, so we inline the lookup here
         local char = lp.Character
         local hrp = char and char:FindFirstChild("HumanoidRootPart")
         if hrp then
-            createGhost(hrp.Position)
-        end
-        local ok, err = pcall(function() raknet.add_send_hook(rakhook) end)
-        if not ok then
-            warn("[void master] raknet hook failed: " .. tostring(err))
+            spoofCF = hrp.CFrame
+            createGhost(spoofCF.Position)
         end
     else
-        pcall(function() raknet.remove_send_hook(rakhook) end)
+        spoofCF = nil
         removeGhost()
     end
 end
@@ -817,15 +808,63 @@ reg("heartbeat", RunService.Heartbeat:Connect(function(dt)
         lastValidPos = nil
     end
     
-    -- === velocity spoof (anti-silent aim) ===
-    if cfg.velSpoof and not cfg.voidSpam and not cfg.voidHead then
+    -- === velocity spoof & anti-client loopbring (NaN Spoofer) ===
+    -- we disable this when orbiting or void spamming so we don't break our own constraints
+    if cfg.velSpoof and not cfg.voidSpam and not cfg.voidHead and not cfg.orbit then
         pcall(function()
-            r.AssemblyLinearVelocity = Vector3.new(math.huge, math.huge, math.huge)
-            r.Velocity = Vector3.new(math.huge, math.huge, math.huge)
+            -- using NaN (0/0) completely corrupts the physics data on enemy clients,
+            -- breaking any local loopbring or local aimbot they try to use against you.
+            local nan = 0/0
+            r.AssemblyLinearVelocity = Vector3.new(nan, nan, nan)
+            r.AssemblyAngularVelocity = Vector3.new(nan, nan, nan)
+            r.Velocity = Vector3.new(nan, nan, nan)
+            r.RotVelocity = Vector3.new(nan, nan, nan)
         end)
     end
     
-    -- (Desync is now handled via RakNet hook)
+    -- === universal desync (heartbeat) ===
+    if cfg.desync and spoofCF then
+        realCF = r.CFrame
+        r.CFrame = spoofCF
+    end
+
+    -- === anti-aim system ===
+    if cfg.aaPitch ~= "off" or cfg.aaYaw ~= "off" then
+        -- We only rotate if we aren't currently being forced by orbit or void features
+        if not (cfg.orbit and cfg.oMode == 'teleport') and not cfg.voidSpam and not cfg.voidHead then
+            local currPos = r.Position
+            local pitchAngle = 0
+            local yawAngle = 0
+            
+            -- Pitch Math
+            if cfg.aaPitch == "up" then pitchAngle = -math.pi/2 + 0.1
+            elseif cfg.aaPitch == "down" then pitchAngle = math.pi/2 - 0.1
+            elseif cfg.aaPitch == "zero" then pitchAngle = 0
+            elseif cfg.aaPitch == "glitch" then pitchAngle = (frame % 2 == 0) and (math.pi/2) or (-math.pi/2)
+            elseif cfg.aaPitch == "random" then pitchAngle = (math.random() * math.pi) - (math.pi/2)
+            elseif cfg.aaPitch == "random2" then pitchAngle = (frame % 3 == 0) and ((math.random() * math.pi) - (math.pi/2)) or pitchAngle
+            end
+            
+            -- Yaw Base Math
+            local baseCFrame = r.CFrame
+            if cfg.aaYawBase == "at target" and cfg.selected then
+                local tp = cachedFind(cfg.selected)
+                if tp and tp.Character and tp.Character:FindFirstChild("HumanoidRootPart") then
+                    baseCFrame = CFrame.lookAt(currPos, tp.Character.HumanoidRootPart.Position)
+                end
+            end
+            
+            -- Yaw Math
+            if cfg.aaYaw == "backward" then yawAngle = math.pi
+            elseif cfg.aaYaw == "forward" then yawAngle = 0
+            elseif cfg.aaYaw == "stutter spin" then yawAngle = (frame % 2 == 0) and (math.pi) or (math.pi/2)
+            elseif cfg.aaYaw == "glitch spin" then yawAngle = math.random() * (math.pi * 2)
+            end
+            
+            -- Apply Anti-Aim CFrame
+            r.CFrame = CFrame.new(currPos) * CFrame.Angles(0, yawAngle, 0) * baseCFrame.Rotation * CFrame.Angles(pitchAngle, 0, 0)
+        end
+    end
 
     -- === void spammer ===
     if cfg.voidSpam then
@@ -899,6 +938,50 @@ reg("heartbeat", RunService.Heartbeat:Connect(function(dt)
         end
     end
 
+    -- === hitbox defense & skeleton manipulation ===
+    if myChar then
+        local hd = myChar:FindFirstChild("Head")
+        local rootJoint = r:FindFirstChild("RootJoint")
+        local neck = hd and hd:FindFirstChild("Neck")
+        
+        -- Impossible Hit Pose (crumple into a ball)
+        if cfg.hitPose then
+            pcall(function()
+                for _, v in pairs(myChar:GetDescendants()) do
+                    if v:IsA("Motor6D") and v.Name ~= "RootJoint" and v.Name ~= "Neck" then
+                        v.C0 = CFrame.new(0, 0, 0)
+                        v.Transform = CFrame.new(0, 0, 0)
+                    end
+                end
+                if rootJoint then
+                    rootJoint.C0 = CFrame.new(0, -2, 0) * CFrame.Angles(math.pi/2, 0, 0)
+                end
+                if neck then
+                    neck.C0 = CFrame.new(0, -1, 0) * CFrame.Angles(-math.pi/2, 0, 0)
+                end
+            end)
+        elseif cfg.antiHead then
+            -- Anti-Headshot only (bury head in torso)
+            pcall(function()
+                if neck then
+                    neck.C0 = CFrame.new(0, -1.5, 0)
+                end
+            end)
+        else
+            -- Restore skeleton if disabled
+            pcall(function()
+                if neck and neck.C0.Y < -0.5 then
+                    neck.C0 = CFrame.new(0, 1, 0) * CFrame.Angles(math.pi/2, math.pi, 0) -- default R6/R15 approx
+                end
+            end)
+        end
+        
+        -- Hide in Floor
+        if cfg.hideFloor then
+            r.CFrame = r.CFrame * CFrame.new(0, -3.5, 0)
+        end
+    end
+
     -- === godmode ===
     if cfg.godmode then
         local h = hum()
@@ -946,11 +1029,68 @@ reg("heartbeat", RunService.Heartbeat:Connect(function(dt)
             if tHRP then
                 local dir = cfg.oRev and -1 or 1
                 cfg.oAng = cfg.oAng + (cfg.oSpd * dt * dir)
-                local bobY = cfg.oBob and math.sin(cfg.oAng*1.5)*cfg.oBobAmt or 0
-                local tPos = tHRP.Position
-                local np = Vector3.new(tPos.X+math.cos(cfg.oAng)*cfg.oRad, tPos.Y+cfg.oH+bobY, tPos.Z+math.sin(cfg.oAng)*cfg.oRad)
                 
-                -- Create constraints once, then just update targets
+                -- Add dynamic unpredictable wobble if enabled
+                local wobbleX, wobbleZ = 0, 0
+                if cfg.oRand then
+                    wobbleX = math.sin(tick() * 5) * (cfg.oRad * 0.2)
+                    wobbleZ = math.cos(tick() * 4) * (cfg.oRad * 0.2)
+                end
+                
+                local bobY = cfg.oBob and math.sin(cfg.oAng*1.5)*cfg.oBobAmt or 0
+                
+                -- Orbit Resolver (Predict actual position ignoring NaN)
+                local tPos = tHRP.Position
+                if cfg.oResolver then
+                    local vel = tHRP.AssemblyLinearVelocity
+                    if vel.X ~= vel.X or vel.Y ~= vel.Y or vel.Z ~= vel.Z or vel.Magnitude > 1000 then
+                        -- Enemy is using NaN / vel spoof. Ignore their fake velocity.
+                        tPos = tHRP.Position
+                    else
+                        tPos = tHRP.Position + (vel * 0.05)
+                    end
+                end
+
+                local np = Vector3.new(
+                    tPos.X + math.cos(cfg.oAng)*cfg.oRad + wobbleX, 
+                    tPos.Y + cfg.oH + bobY, 
+                    tPos.Z + math.sin(cfg.oAng)*cfg.oRad + wobbleZ
+                )
+                
+                -- Orbit Smart (Wall check)
+                if cfg.oSmart then
+                    local ray = RaycastParams.new()
+                    ray.FilterType = Enum.RaycastFilterType.Exclude
+                    ray.FilterDescendantsInstances = {myChar, tp.Character}
+                    local res = workspace:Raycast(tPos, np - tPos, ray)
+                    if res then
+                        np = res.Position + (tPos - np).Unit * 1.5 -- pull back from wall
+                    end
+                end
+                
+                -- Orbit Aura (Auto-Swing)
+                if cfg.oAura and (r.Position - tPos).Magnitude < 20 then
+                    if stompRem then pcall(function() stompRem:FireServer() end) end
+                end
+
+                if cfg.oMode == 'teleport' then
+                    -- Clean up align constraints if we are in TP mode
+                    if orbitAP then pcall(function() orbitAP:Destroy() end); orbitAP = nil end
+                    if orbitAO then pcall(function() orbitAO:Destroy() end); orbitAO = nil end
+                    
+                    if not orbitTpWait then orbitTpWait = 0 end
+                    orbitTpWait = orbitTpWait + dt
+                    if orbitTpWait >= (cfg.oTpDelay or 0.1) then
+                        orbitTpWait = 0
+                        if cfg.oFace then
+                            r.CFrame = CFrame.lookAt(np, tPos)
+                        else
+                            local tan=Vector3.new(-math.sin(cfg.oAng),0,math.cos(cfg.oAng))*dir
+                            r.CFrame = CFrame.lookAt(np,np+tan)
+                        end
+                        pcall(function() r.Velocity=V3ZERO;r.AssemblyLinearVelocity=V3ZERO end)
+                    end
+                else
                 if not orbitAtt or not orbitAtt.Parent then
                     orbitAtt = Instance.new("Attachment", r)
                     orbitAtt.Name = "OrbitAttachment"
@@ -984,6 +1124,7 @@ reg("heartbeat", RunService.Heartbeat:Connect(function(dt)
                 
                 -- Zero velocity so we don't drift
                 pcall(function() r.Velocity=V3ZERO;r.AssemblyLinearVelocity=V3ZERO end)
+            end
             end
         end
     else
@@ -1081,8 +1222,10 @@ reg("render", RunService.RenderStepped:Connect(function()
     hudFrame = hudFrame + 1
     local r = root()
     
-    -- (Desync is now handled via RakNet hook)
-
+    -- === universal desync (renderstepped revert) ===
+    if cfg.desync and realCF then
+        if r then r.CFrame = realCF end
+    end
     -- === determine action (cheap, no alloc) ===
     if cfg.isHealing then cfg.action = "healing..."
     elseif cfg.voidHead and cfg.voidHeadTgt then cfg.action = "void head attack"
@@ -1307,6 +1450,14 @@ pR:AddToggle('t_ob',{Text='height bob',Default=false,Callback=function(v) cfg.oB
 pR:AddSlider('s_oba',{Text='bob amount',Default=3,Min=1,Max=15,Rounding=1,Callback=function(v) cfg.oBobAmt=v end})
 pR:AddToggle('t_ore',{Text='reverse',Default=false,Callback=function(v) cfg.oRev=v end})
 pR:AddToggle('t_of',{Text='face target',Default=true,Callback=function(v) cfg.oFace=v end})
+pR:AddToggle('t_orand',{Text='random wobble',Default=true,Callback=function(v) cfg.oRand=v end})
+pR:AddSlider('s_osm',{Text='responsiveness',Default=200,Min=10,Max=500,Rounding=0,Callback=function(v) cfg.oSmooth=v end})
+pR:AddDropdown('d_om',{Text='orbit mode',Values={'smooth','teleport'},Default='smooth',Callback=function(v) cfg.oMode=v end})
+pR:AddSlider('s_otpd',{Text='tp delay',Default=0.1,Min=0.01,Max=1,Rounding=2,Callback=function(v) cfg.oTpDelay=v end})
+pR:AddToggle('t_ors',{Text='orbit resolver',Default=false,Callback=function(v) cfg.oResolver=v end})
+pR:AddToggle('t_osmt',{Text='orbit smart (wall check)',Default=false,Callback=function(v) cfg.oSmart=v end})
+pR:AddToggle('t_oaur',{Text='orbit aura (kill aura)',Default=false,Callback=function(v) cfg.oAura=v end})
+pR:AddSlider('s_osm',{Text='responsiveness',Default=200,Min=10,Max=500,Rounding=0,Callback=function(v) cfg.oSmooth=v end})
 
 pBL:AddToggle('t_br',{Text='loop bring',Default=false,Callback=function(v) cfg.bring=v;bringWait=0 end})
 pBL:AddSlider('s_bd',{Text='distance',Default=5,Min=1,Max=30,Rounding=1,Callback=function(v) cfg.bDist=v end})
@@ -1452,16 +1603,16 @@ mR:AddButton({Text='tp to safe zone',Func=function() local r=root();if r then r.
 -- anti-rager tab
 local arL = T.anti_rager:AddLeftGroupbox('defense')
 local arR = T.anti_rager:AddRightGroupbox('info')
-arL:AddToggle('t_desync',{Text='network desync (raknet)',Default=false,Callback=function(v) 
+arL:AddToggle('t_desync',{Text='network desync (universal)',Default=false,Callback=function(v) 
     cfg.desync=v 
-    toggleRakNetDesync(v)
+    toggleDesync(v)
     if v then
-        Library:Notify({Title='desync', Content='raknet hook active - ghost spawned', Duration=3})
+        Library:Notify({Title='desync', Content='universal desync active - ghost spawned', Duration=3})
     else
-        Library:Notify({Title='desync', Content='raknet hook removed', Duration=2})
+        Library:Notify({Title='desync', Content='desync removed', Duration=2})
     end
 end})
-arL:AddLabel('freezes your server hitbox, enemies miss')
+arL:AddLabel('universal cframe desync - 100% executor support')
 arL:AddDivider()
 arL:AddToggle('t_velspoof',{Text='velocity spoof (anti-silent aim)',Default=false,Callback=function(v) cfg.velSpoof=v end})
 arL:AddLabel('breaks enemy aimbot prediction')
@@ -1472,7 +1623,17 @@ arL:AddDivider()
 arL:AddToggle('t_antiattach',{Text='anti attach / fling',Default=false,Callback=function(v) cfg.antiAttach=v end})
 arL:AddLabel('destroys foreign welds on your char')
 
-arR:AddLabel('desync: intercepts packet 0x1B')
+local arAA = T.anti_rager:AddRightGroupbox('anti-aim')
+arAA:AddDropdown('d_aap',{Text='pitch',Values={'off','up','zero','down','glitch','random','random2'},Default='off',Callback=function(v) cfg.aaPitch=v end})
+arAA:AddDropdown('d_aayb',{Text='yaw base',Values={'local','at target'},Default='local',Callback=function(v) cfg.aaYawBase=v end})
+arAA:AddDropdown('d_aay',{Text='yaw',Values={'off','stutter spin','glitch spin','backward','forward'},Default='off',Callback=function(v) cfg.aaYaw=v end})
+
+local arHD = T.anti_rager:AddLeftGroupbox('hitbox defense')
+arHD:AddToggle('t_hif',{Text='hide in floor',Default=false,Callback=function(v) cfg.hideFloor=v end})
+arHD:AddToggle('t_ahs',{Text='anti headshot',Default=false,Callback=function(v) cfg.antiHead=v end})
+arHD:AddToggle('t_pose',{Text='impossible hit pose',Default=false,Callback=function(v) cfg.hitPose=v end})
+
+arR:AddLabel('desync: heartbeat/renderstepped spoofing')
 arR:AddLabel('vel spoof: sets velocity to inf')
 arR:AddLabel('anti-bring: 50 stud threshold')
 arR:AddLabel('anti-attach: checks every frame')
@@ -1499,7 +1660,7 @@ UserInputService.InputBegan:Connect(function(input, gp)
         cfg.silent=false;cfg.stomp=false;cfg.godmode=false;cfg.antiVoid=false
         cfg.autoHeal=false;cfg.emergTp=false
         -- anti-rager cleanup
-        if cfg.desync then cfg.desync=false;pcall(toggleRakNetDesync,false) end
+        if cfg.desync then cfg.desync=false;pcall(toggleDesync,false) end
         cfg.velSpoof=false;cfg.antiBring=false;cfg.antiAttach=false
         fovC.Visible=false
         Library:Notify({Title='panic', Content='all features disabled', Duration=2})
